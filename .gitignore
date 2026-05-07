@@ -48,3 +48,5 @@ Desktop.ini
 *.tmp
 *.bak
 *.log
+
+.devcontainer/
