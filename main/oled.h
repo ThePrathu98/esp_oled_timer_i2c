@@ -7,6 +7,9 @@
 #include "esp_err.h"
 #include "driver/i2c_master.h"
 
+//Added one SSD1306 macro for setting page start address. This is used in oled_set_cursor() and oled_clear() functions.
+#define SSD1306_CMD_SET_PAGE_START(page)    (0xB0 | ((page) & 0x07))
+
 /*
  * SSD1306 display size used by this project.
  * 128 columns x 64 rows = 8 pages of 8 pixels each.

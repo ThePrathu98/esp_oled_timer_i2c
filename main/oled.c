@@ -6,6 +6,8 @@
 #include "oled.h"
 #include "oled_cmd_table.h"
 
+#define OLED_I2C_TIMEOUT_MS    100      //Change timeout from 1000 ms to 100 ms
+
 /*
  * Private OLED device handle.
  * oled_init() stores the handle here so the remaining OLED functions can use it.
@@ -31,7 +33,7 @@ static esp_err_t oled_write_cmd(uint8_t cmd)
     esp_err_t ret = i2c_master_transmit(oled_dev_handle,
                                         data,
                                         sizeof(data),
-                                        1000);
+                                        OLED_I2C_TIMEOUT_MS);
 
     if (ret != ESP_OK)
     {
@@ -140,7 +142,7 @@ esp_err_t oled_clear(void)
 
     for (uint8_t page = 0; page < 8; page++)
     {
-        ret = oled_write_cmd((uint8_t)(0xB0 + page));
+        ret = oled_write_cmd((uint8_t)(SSD1306_CMD_SET_PAGE_START(page)));
 
         if (ret != ESP_OK)
         {

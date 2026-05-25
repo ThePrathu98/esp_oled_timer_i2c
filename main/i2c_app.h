@@ -10,7 +10,7 @@
  */
 #define I2C_MASTER_SCL_IO     22
 #define I2C_MASTER_SDA_IO     21
-#define I2C_MASTER_FREQ_HZ    100000    //100khz is freq. for oled, std value for I2C. can use 400khz 
+#define I2C_MASTER_FREQ_HZ    400000    // 400 kHz Fast-mode reduces OLED transfer time.
 #define OLED_I2C_ADDR         0x3C
 
 /*

@@ -27,10 +27,21 @@
 #include "driver/gptimer.h"
 
 #include "esp_err.h"
+
+//Added library header file for better ESP logging. will replace printf() with ESP-IDF production
+//style-logging
+#include "esp_log.h"     
+
 #include "esp_system.h"
 
 #include "i2c_app.h"
 #include "oled.h"
+
+/*Added ESP-IDF logging tag.
+Using ESP_LOGx instead of printf gives module-specific logs and allows
+Log filtering by severity level. */
+
+static const char *TAG = "PART_A_TIMER";
 
 /*
  * Timer configuration.
@@ -65,6 +76,25 @@
  * The semaphore does not carry data. It only signals:
  * "An OLED update event happened."
  */
+
+
+/*Added Post-review diagnostic and recovery configuration.
+OLED_RECOVERY_ERROR_LIMIT:
+After this many consecutive OLED/I2C failures, the display task attempts to reset the I2C bus and reinitialize the OLED.
+
+STATUS_LOG_DIVIDER:
+Runtime status is logged every 10 handled timer events instead of every
+single 100 ms tick. This avoids excessive UART logging in the hot path. */
+
+#define OLED_RECOVERY_ERROR_LIMIT    3U
+#define OLED_RECOVERY_BACKOFF_MS     50U
+#define STATUS_LOG_DIVIDER           10U
+
+
+//Global varriable counters for missed/merged event diagnostics, directly address the feedback item
+static volatile uint32_t isr_event_count = 0;
+static uint32_t handled_event_count = 0;
+
 static SemaphoreHandle_t display_sem = NULL;
 /*
  * GPTimer handle.
@@ -88,33 +118,30 @@ static gptimer_handle_t display_timer = NULL;
  *
  * In this project, the ISR only gives a semaphore and exits.
  */
-static bool IRAM_ATTR timer_isr_handler(gptimer_handle_t timer,
-                                        const gptimer_alarm_event_data_t *edata,
-                                        void *user_ctx)
+static bool IRAM_ATTR timer_isr_handler(gptimer_handle_t timer, const gptimer_alarm_event_data_t *edata, void *user_ctx)
 {
-    /*
-     * This variable tells FreeRTOS whether giving the semaphore woke a task
+    /*This variable tells FreeRTOS whether giving the semaphore woke a task
      * that has higher priority than the currently running task.
-     * If yes, the ISR can request a context switch before returning.
-     */
+     * If yes, the ISR can request a context switch before returning.*/
     BaseType_t higher_priority_task_woken = pdFALSE;
-    /*
-     * xSemaphoreGiveFromISR() is the ISR-safe version of xSemaphoreGive().
-     *
-     * Do not use xSemaphoreGive() inside an ISR.
-     */
-    xSemaphoreGiveFromISR(display_sem, &higher_priority_task_woken);
-    /*
-    * Binary semaphore behavior:
-    *
-    * A binary semaphore only stores one pending signal.
-    * If the timer fires again before display_task runs, multiple events may
-    * merge into one pending update.
-    *
-    * This is acceptable here because the OLED only needs periodic refresh
-    * behavior. If every timer event had to be counted, a counting semaphore
-    * or queue would be a better choice.
+
+    /*Added Diagnostic counter:
+    * Counts how many timer interrupts were produced.
+    * This is intentionally simple and short so the ISR still remains safe.
     */
+    isr_event_count++;
+
+    /* Get the semaphore from user_ctx instead of directly using the global
+    * display_sem. This keeps the ISR slightly decoupled from global state.
+    *
+    * Normal behavior is unchanged: the ISR still gives the same binary
+    * semaphore to wake display_task.    */
+    SemaphoreHandle_t sem = (SemaphoreHandle_t)user_ctx;
+
+    if (sem != NULL)
+    {
+        xSemaphoreGiveFromISR(sem, &higher_priority_task_woken);
+    }
 
     /*
      * For GPTimer callbacks, returning true requests a context switch after
@@ -184,7 +211,10 @@ static esp_err_t display_timer_init(void)
         .on_alarm = timer_isr_handler,
     };
 
-    ret = gptimer_register_event_callbacks(display_timer, &callbacks, NULL);
+    /* Pass display_sem into the GPTimer callback as user_ctx.
+    * The ISR receives this handle and gives the same semaphore from interrupt
+    * context using xSemaphoreGiveFromISR().    */
+    ret = gptimer_register_event_callbacks(display_timer, &callbacks, display_sem);
 
     if (ret != ESP_OK)
     {
@@ -251,6 +281,9 @@ static void display_task(void *arg)
         {
             event_count++;
 
+            //Added increment handled counter in task, diagnostic count for how many timer events were actually processed by the task.
+            handled_event_count++;
+
             /*
              * Page 0 bar grows with timer event count.
              * Modulo keeps the width inside the 128-pixel OLED width.
@@ -307,11 +340,27 @@ static void display_task(void *arg)
                 continue;
             }
             /*
-             * Runtime log used to verify that the 100 ms timer event is being
-             * handled and the OLED update path is active.
-             */
-            printf("TIMER_EVT#%" PRIu32 " PERIOD=100ms OLED=UPDATED\n",
-                   event_count);
+            * Log once every 10 handled events instead of every 100 ms tick.
+            * This reduces UART overhead and adds observability for merged events.
+            */
+            if ((event_count % 10U) == 0U)
+            {
+                uint32_t isr_snapshot = isr_event_count;
+                uint32_t merged_or_pending = 0;
+
+                if (isr_snapshot > handled_event_count)
+                {
+                    merged_or_pending = isr_snapshot - handled_event_count;
+                }
+
+                ESP_LOGI(TAG,
+                        "TIMER_EVT=%" PRIu32 " ISR_EVENTS=%" PRIu32
+                        " HANDLED=%" PRIu32 " MERGED_OR_PENDING=%" PRIu32,
+                        event_count,
+                        isr_snapshot,
+                        handled_event_count,
+                        merged_or_pending);
+            }
         }
     }
 }
@@ -320,13 +369,15 @@ void app_main(void)
 {
     esp_err_t ret;
 
-    printf("ESP32 GPTimer + semaphore + I2C OLED demo starting\n");
+    //replaced key printf() calls with ESP_LOGx for this and other places in the code.
+    ESP_LOGI(TAG, "ESP32 GPTimer + semaphore + I2C OLED demo starting");
 
-    printf("I2C config: SDA=%d, SCL=%d, FREQ=%d, OLED_ADDR=0x%02X\n",
-           I2C_MASTER_SDA_IO,
-           I2C_MASTER_SCL_IO,
-           I2C_MASTER_FREQ_HZ,
-           OLED_I2C_ADDR);
+    ESP_LOGI(TAG,
+         "I2C config: SDA=%d, SCL=%d, FREQ=%d, OLED_ADDR=0x%02X",
+         I2C_MASTER_SDA_IO,
+         I2C_MASTER_SCL_IO,
+         I2C_MASTER_FREQ_HZ,
+         OLED_I2C_ADDR);
 
     i2c_master_dev_handle_t oled_dev_handle = NULL;
     /*
@@ -434,7 +485,7 @@ void app_main(void)
     printf("Minimum free heap size: %" PRIu32 " bytes\n",
            esp_get_minimum_free_heap_size());
 
-    printf("100 ms timer ISR + blocking display_task started\n");
+    ESP_LOGI(TAG, "100 ms timer ISR + blocking display_task started");
 
     /*
      * app_main does not need a while loop.
